@@ -1,0 +1,343 @@
+const db = require('../config/database');
+
+class PaymentService {
+  /**
+   * Initiate a payment for queue entry
+   */
+  async initiatePayment({ patient_id, payment_method, amount, payment_type = 'consultation' }) {
+    try {
+      // Generate transaction ID
+      const transaction_id = `TXN-${Date.now()}-${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
+      
+      // Create payment record
+      const result = await db.query(
+        `INSERT INTO payments (patient_id, payment_type, amount, status, payment_method, transaction_id) 
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+        [patient_id, payment_type, amount, 'pending', payment_method, transaction_id]
+      );
+
+      const payment = result.rows[0];
+
+      // For digital payments (card/mobile), generate payment URL
+      let payment_url = null;
+      if (payment_method === 'card' || payment_method === 'mobile') {
+        payment_url = await this.generatePaymentGatewayURL(payment);
+      }
+
+      return {
+        payment_id: payment.id,
+        transaction_id: payment.transaction_id,
+        status: payment.status,
+        payment_url,
+        amount: payment.amount
+      };
+    } catch (error) {
+      console.error('Error initiating payment:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Generate payment gateway URL (mock implementation)
+   * In production, integrate with actual payment gateway
+   */
+  async generatePaymentGatewayURL(payment) {
+    // Mock payment gateway URL
+    // In production, call actual payment gateway API
+    const baseUrl = process.env.PAYMENT_GATEWAY_URL || 'https://payment-gateway.example.com';
+    return `${baseUrl}/pay/${payment.transaction_id}`;
+  }
+
+  /**
+   * Verify and confirm payment
+   */
+  async verifyPayment({ payment_id, verification_status, notes, verified_by }) {
+    try {
+      const status = verification_status === 'confirmed' ? 'paid' : 'cancelled';
+      
+      const result = await db.query(
+        `UPDATE payments 
+         SET status = $1, verified_by = $2, verified_at = CURRENT_TIMESTAMP
+         WHERE id = $3 RETURNING *`,
+        [status, verified_by, payment_id]
+      );
+
+      if (result.rows.length === 0) {
+        throw new Error('Payment not found');
+      }
+
+      const payment = result.rows[0];
+
+      // If payment confirmed, trigger queue entry and receipt generation
+      if (status === 'paid') {
+        await this.onPaymentConfirmed(payment);
+      }
+
+      return payment;
+    } catch (error) {
+      console.error('Error verifying payment:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Handle payment webhook from gateway
+   */
+  async handleWebhook({ transaction_id, status, amount, payment_method, card_last4, card_brand }) {
+    try {
+      // Find payment by transaction ID
+      const paymentResult = await db.query(
+        'SELECT * FROM payments WHERE transaction_id = $1',
+        [transaction_id]
+      );
+
+      if (paymentResult.rows.length === 0) {
+        throw new Error('Payment not found for transaction: ' + transaction_id);
+      }
+
+      const payment = paymentResult.rows[0];
+
+      // Update payment status
+      const newStatus = status === 'success' ? 'paid' : 'failed';
+      
+      await db.query(
+        `UPDATE payments 
+         SET status = $1, card_last4 = $2, card_brand = $3, updated_at = CURRENT_TIMESTAMP
+         WHERE id = $4`,
+        [newStatus, card_last4, card_brand, payment.id]
+      );
+
+      // If payment successful, trigger queue entry and receipt
+      if (newStatus === 'paid') {
+        const updatedPayment = { ...payment, status: newStatus };
+        await this.onPaymentConfirmed(updatedPayment);
+      }
+
+      return { success: true, status: newStatus };
+    } catch (error) {
+      console.error('Error handling webhook:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Actions to perform when payment is confirmed
+   */
+  async onPaymentConfirmed(payment) {
+    try {
+      // 1. Generate receipt
+      await this.generateReceipt(payment);
+
+      // 2. Add patient to queue (will be handled by queue service)
+      // This is called from the queue route after payment confirmation
+
+      // 3. Send notification
+      const notificationService = require('./notificationService');
+      await notificationService.sendPaymentReceiptNotification(payment);
+
+    } catch (error) {
+      console.error('Error in onPaymentConfirmed:', error);
+      // Don't throw - payment is already confirmed
+    }
+  }
+
+  /**
+   * Generate digital receipt
+   */
+  async generateReceipt(payment) {
+    try {
+      // Get patient details
+      const patientResult = await db.query(
+        'SELECT first_name, last_name FROM patients WHERE id = $1',
+        [payment.patient_id]
+      );
+
+      if (patientResult.rows.length === 0) {
+        throw new Error('Patient not found');
+      }
+
+      const patient = patientResult.rows[0];
+      const patient_name = `${patient.first_name} ${patient.last_name}`;
+
+      // Create receipt record (receipt_number auto-generated by trigger)
+      const receiptData = {
+        payment_id: payment.id,
+        patient_name,
+        amount: payment.amount,
+        payment_method: payment.payment_method,
+        transaction_id: payment.transaction_id,
+        payment_date: payment.created_at
+      };
+
+      const result = await db.query(
+        `INSERT INTO payment_receipts 
+         (payment_id, patient_name, amount, payment_method, transaction_id, receipt_data) 
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+        [
+          receiptData.payment_id,
+          receiptData.patient_name,
+          receiptData.amount,
+          receiptData.payment_method,
+          receiptData.transaction_id,
+          JSON.stringify(receiptData)
+        ]
+      );
+
+      const receipt = result.rows[0];
+
+      // Update payment with receipt URL
+      await db.query(
+        'UPDATE payments SET receipt_url = $1 WHERE id = $2',
+        [`/api/receipts/${receipt.receipt_number}`, payment.id]
+      );
+
+      return receipt;
+    } catch (error) {
+      console.error('Error generating receipt:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get payment history for a patient
+   */
+  async getPaymentHistory(patient_id, filters = {}) {
+    try {
+      let query = `
+        SELECT p.*, pr.receipt_number, pr.receipt_data
+        FROM payments p
+        LEFT JOIN payment_receipts pr ON p.id = pr.payment_id
+        WHERE p.patient_id = $1
+      `;
+      
+      const params = [patient_id];
+      let paramCount = 2;
+
+      // Apply filters
+      if (filters.status) {
+        query += ` AND p.status = $${paramCount}`;
+        params.push(filters.status);
+        paramCount++;
+      }
+
+      if (filters.start_date) {
+        query += ` AND p.created_at >= $${paramCount}`;
+        params.push(filters.start_date);
+        paramCount++;
+      }
+
+      if (filters.end_date) {
+        query += ` AND p.created_at <= $${paramCount}`;
+        params.push(filters.end_date);
+        paramCount++;
+      }
+
+      query += ' ORDER BY p.created_at DESC';
+
+      const result = await db.query(query, params);
+      return result.rows;
+    } catch (error) {
+      console.error('Error getting payment history:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Process refund
+   */
+  async processRefund({ payment_id, refund_reason, refund_amount, processed_by }) {
+    try {
+      // Get payment details
+      const paymentResult = await db.query(
+        'SELECT * FROM payments WHERE id = $1',
+        [payment_id]
+      );
+
+      if (paymentResult.rows.length === 0) {
+        throw new Error('Payment not found');
+      }
+
+      const payment = paymentResult.rows[0];
+
+      // Validate refund amount
+      if (refund_amount > payment.amount) {
+        throw new Error('Refund amount cannot exceed payment amount');
+      }
+
+      // Update payment status
+      await db.query(
+        `UPDATE payments 
+         SET status = 'refunded', refund_reason = $1, refunded_at = CURRENT_TIMESTAMP, processed_by = $2
+         WHERE id = $3`,
+        [refund_reason, processed_by, payment_id]
+      );
+
+      // If digital payment, initiate gateway refund
+      if (payment.payment_method === 'card' || payment.payment_method === 'mobile') {
+        await this.initiateGatewayRefund(payment, refund_amount);
+      }
+
+      // Send refund notification
+      const notificationService = require('./notificationService');
+      await notificationService.sendRefundNotification(payment, refund_amount);
+
+      return { success: true, message: 'Refund processed successfully' };
+    } catch (error) {
+      console.error('Error processing refund:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Initiate refund with payment gateway (mock)
+   */
+  async initiateGatewayRefund(payment, amount) {
+    // Mock implementation
+    // In production, call actual payment gateway refund API
+    console.log(`Initiating gateway refund for ${payment.transaction_id}: ${amount}`);
+    return { success: true };
+  }
+
+  /**
+   * Get receipt by receipt number
+   */
+  async getReceipt(receipt_number) {
+    try {
+      const result = await db.query(
+        'SELECT * FROM payment_receipts WHERE receipt_number = $1',
+        [receipt_number]
+      );
+
+      if (result.rows.length === 0) {
+        throw new Error('Receipt not found');
+      }
+
+      return result.rows[0];
+    } catch (error) {
+      console.error('Error getting receipt:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get pending payments for receptionist verification
+   */
+  async getPendingPayments() {
+    try {
+      const result = await db.query(
+        `SELECT p.*, pt.first_name, pt.last_name, pt.patient_id
+         FROM payments p
+         JOIN patients pt ON p.patient_id = pt.id
+         WHERE p.status = 'pending' AND p.payment_method = 'cash'
+         ORDER BY p.created_at DESC`
+      );
+
+      return result.rows;
+    } catch (error) {
+      console.error('Error getting pending payments:', error);
+      throw error;
+    }
+  }
+}
+
+module.exports = new PaymentService();
